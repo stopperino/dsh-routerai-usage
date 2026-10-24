@@ -1,0 +1,16 @@
+# dsh-routerai-usage — balance and per-request cost for the RouterAI gateway.
+#
+# The Host half polls GET {baseURL}/credits for the account balance and looks up
+# GET {baseURL}/generation?id=<responseId> for the real cost of every model call,
+# then serves both over a same-origin bridge at /api/dsh-routerai-usage.
+# The Client half renders them under the composer.
+#
+# Knobs:
+#   pollSeconds: balance refresh interval (default 30)
+#   baseURL:     RouterAI API root (default https://routerai.ru/api/v1)
+- insert:
+    - id: routerai-usage
+      name: dsh-routerai-usage
+      config:
+        pollSeconds: 30
+        baseURL: https://routerai.ru/api/v1

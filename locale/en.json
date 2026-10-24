@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "title": "RouterAI: balance and request cost",
+    "description": "Shows the RouterAI account balance in rubles under the composer and what each model request in the current session cost."
+  },
+  "title": "RouterAI",
+  "balance": "Balance",
+  "sessionTotal": "Session",
+  "refresh": "Refresh",
+  "noKey": "no ROUTERAI_API_KEY configured",
+  "error": "error",
+  "pending": "…",
+  "unpriced": "—",
+  "requests": "Requests",
+  "total": "Total",
+  "calls": "requests"
+}
