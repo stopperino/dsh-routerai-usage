@@ -6,11 +6,17 @@
 # The Client half renders them under the composer.
 #
 # Knobs:
-#   pollSeconds: balance refresh interval (default 30)
-#   baseURL:     RouterAI API root (default https://routerai.ru/api/v1)
+#   pollSeconds:     balance refresh interval while the widget is on screen (default 30)
+#   idlePollSeconds: balance refresh interval while nobody is looking (default 300)
+#   baseURL:         RouterAI API root (default https://routerai.ru/api/v1)
+#
+# `idlePollSeconds` exists because `/credits` used to be polled every 30 s for the whole lifetime
+# of the Host — 2 880 requests a day that nobody saw, perfectly periodic. Unattended it now drops to
+# 1 request / 5 minutes. Both knobs are floored at 10 s, and idle is never allowed below pollSeconds.
 - insert:
     - id: routerai-usage
       name: dsh-routerai-usage
       config:
         pollSeconds: 30
+        idlePollSeconds: 300
         baseURL: https://routerai.ru/api/v1

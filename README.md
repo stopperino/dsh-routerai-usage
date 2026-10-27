@@ -10,7 +10,8 @@ provider and by model.
 505,14 ₽   ◎ 147,04 ₽
 ```
 
-Hover the figure to see the breakdown:
+Click the figure to see the breakdown (click only — hovering does not open it; the next click, an
+outside click, or Escape closes it):
 
 ```
 ◈ routerai                                    505,14 ₽
@@ -47,6 +48,12 @@ already cached costs **no upstream request at all** — measured: 848 rows resol
 The cache stores only `generationId → rubles`. No tokens, no models, no prompts, no session
 content. It is written atomically and is ignored if unreadable.
 
+`GET /credits` follows whether anyone is looking. While the widget is mounted the Client polls
+`/rows` every 1.5 s, which doubles as a presence signal, so the balance refreshes every `pollSeconds`.
+Once that goes quiet the Host stretches the interval to `idlePollSeconds` (default 5 minutes), and the
+Client stops polling entirely while the tab is hidden. Unattended traffic therefore drops from
+2 880 requests a day to ~288 instead of hammering the gateway around the clock.
+
 ## Install
 
 ```bash
@@ -64,7 +71,8 @@ The row accepts these options in `cordis.patch.yml`:
 - id: routerai-usage
   name: dsh-routerai-usage
   config:
-    pollSeconds: 30                          # balance refresh interval
+    pollSeconds: 30                          # balance refresh while the widget is on screen
+    idlePollSeconds: 300                     # balance refresh while nobody is looking
     baseURL: https://routerai.ru/api/v1      # API root
 ```
 

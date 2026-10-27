@@ -28,6 +28,18 @@ import { join as joinPath } from 'node:path';
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const DEFAULT_BASE_URL = 'https://routerai.ru/api/v1';
 const DEFAULT_POLL_SECONDS = 30;
+/**
+ * Balance refresh interval while nobody is displaying the widget.
+ *
+ * `/credits` used to be polled every `pollSeconds` for the entire lifetime of the Host - 2 880
+ * requests a day that are completely invisible to the user and perfectly periodic, which is the
+ * worst possible traffic shape for an upstream bot filter. The Client polls `/rows` every 1.5 s
+ * while its widget is mounted, so "a `rows` call arrived recently" is a free, accurate presence
+ * signal: when it goes quiet, stretch the interval instead of hammering.
+ */
+const DEFAULT_IDLE_POLL_SECONDS = 300;
+/** How long one `rows` call keeps the widget considered attended. */
+const PRESENCE_TTL_MS = 60_000;
 /** Credential *reference* name (not a record key): resolved per call, never cached. */
 const CREDENTIAL_REF = 'ROUTERAI_API_KEY';
 /** RouterAI balance/usage is returned in rubles (see CONTRACT.md). */
@@ -64,6 +76,9 @@ const CACHE_FLUSH_MS = 15_000;
 // ---------------------------------------------------------------------------
 
 function clampInteger(value, fallback, min, max) {
+  // `Number(null)` and `Number('')` are 0, not NaN, so a null/blank knob would silently clamp to
+  // `min` instead of falling back to its default. Treat "no value" as "use the default".
+  if (value === null || value === undefined || value === '') return fallback;
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(n)));
@@ -75,6 +90,11 @@ function resolveConfig(config) {
   return {
     baseURL: base.replace(/\/+$/, ''),
     pollSeconds: clampInteger(raw.pollSeconds, DEFAULT_POLL_SECONDS, 10, 3600),
+    // Never faster than the attended interval: idle is a throttle, not a second knob to exceed it.
+    idlePollSeconds: Math.max(
+      clampInteger(raw.pollSeconds, DEFAULT_POLL_SECONDS, 10, 3600),
+      clampInteger(raw.idlePollSeconds, DEFAULT_IDLE_POLL_SECONDS, 10, 3600),
+    ),
   };
 }
 
@@ -483,6 +503,25 @@ function apply(ctx, config) {
   const inflight = new Map(); // generationId -> Promise<{costRub, provider, latencyMs, usage} | null>
   let lastSweep = Date.now();
   let balance = { amount: null, updatedAt: null, status: 'loading', error: null };
+  /**
+   * Last time the Client asked for `rows` (i.e. its widget is mounted and polling).
+   * `0` means "never seen", which counts as idle: nobody is watching, so do not poll fast.
+   */
+  let lastPresenceAt = 0;
+  /** Set by the balance poller so an arriving Client can re-arm it immediately (see notePresence). */
+  let onBecameAttended = null;
+  const notePresence = () => {
+    const wasIdle = !isAttended();
+    lastPresenceAt = Date.now();
+    // First contact after an idle stretch: collapse the remaining idle wait instead of leaving the
+    // freshly opened widget staring at a stale balance for up to `idlePollSeconds`.
+    if (wasIdle && typeof onBecameAttended === 'function') {
+      try {
+        onBecameAttended();
+      } catch { /* re-arming is best-effort */ }
+    }
+  };
+  const isAttended = () => Date.now() - lastPresenceAt < PRESENCE_TTL_MS;
 
   const warn = (message) => {
     try {
@@ -899,11 +938,33 @@ function apply(ctx, config) {
   };
 
   // -- balance poller --------------------------------------------------------
+  // The delay is re-chosen after every tick instead of being fixed at registration time, so the
+  // `/credits` rate follows whether anyone is actually looking at the widget (see notePresence):
+  // `pollSeconds` while the Client is polling, `idlePollSeconds` once it has gone quiet.
+  //
+  // This MUST be a one-shot timer re-armed from inside the tick. `startInterval` registers a
+  // *repeating* interval, so re-arming inside its own callback would add a fresh interval on every
+  // tick and the poll rate would grow without bound (observed: balance refreshing every 1 s).
   ctx.effect(() => {
     let stopped = false;
+    let cancel = null; // disposer of the single pending timer, if any
     let lastFlush = 0;
-    const tick = () => {
+
+    const clearPending = () => {
+      const handle = cancel;
+      cancel = null;
+      if (typeof handle === 'function') {
+        try {
+          handle();
+        } catch { /* already disposed */ }
+      }
+    };
+
+    function tick() {
       if (stopped) return;
+      // A `startInterval` handle is a *repeating* timer, so drop it the moment it fires: exactly one
+      // pending timer can exist at a time, on either the Cordis or the global backend.
+      clearPending();
       void fetchBalance().catch(() => {});
       try {
         sweep();
@@ -913,16 +974,25 @@ function apply(ctx, config) {
         lastFlush = Date.now();
         flushPriceCache();
       }
-    };
+      if (stopped) return;
+      const seconds = isAttended() ? settings.pollSeconds : settings.idlePollSeconds;
+      cancel = startInterval(tick, Math.max(1000, seconds * 1000));
+    }
+
     loadPriceCache();
-    const stop = startInterval(tick, Math.max(1000, settings.pollSeconds * 1000));
+    // An arriving Client shortens the wait to `pollSeconds` instead of leaving a stale balance up
+    // for a full idle period.
+    onBecameAttended = () => {
+      if (stopped) return;
+      clearPending();
+      cancel = startInterval(tick, Math.max(1000, settings.pollSeconds * 1000));
+    };
     tick();
     return () => {
       stopped = true;
+      onBecameAttended = null;
       flushPriceCache(); // final write on unload
-      try {
-        stop();
-      } catch { /* already disposed */ }
+      clearPending();
     };
   }, `${name}: balance poller`);
 
@@ -996,7 +1066,7 @@ function apply(ctx, config) {
   // -- session scope (root + every descendant it spawned) --------------------
   // The user asked the main agent to show the whole spend, subagents included. Descendants come
   // from the session lineage; both sources are optional services and are allowed to fail.
-  const SCOPE_CACHE_MS = 30_000;
+  const SCOPE_CACHE_MS = 60_000;
   const MAX_SCOPE_SESSIONS = 50;
   const scopeCache = new Map(); // rootSessionId -> { at, sessions, complete }
 
@@ -1154,6 +1224,8 @@ function apply(ctx, config) {
           currency: CURRENCY,
           configured: balance.status !== 'no-credential',
           pollSeconds: settings.pollSeconds,
+          idlePollSeconds: settings.idlePollSeconds,
+          attended: isAttended(),
           balance: publicBalance(),
           // Diagnostics for the durable charge cache (path + size only; never its contents).
           cache: {
@@ -1186,6 +1258,9 @@ function apply(ctx, config) {
       if (!sessionId) {
         return { ok: false, code: 'session-required', message: 'rows requires a sessionId' };
       }
+      // The Client polls this op every 1.5 s while its widget is mounted: free presence signal that
+      // keeps the balance poller on the fast interval without any extra request of its own.
+      notePresence();
       return { ok: true, value: await scopedPayload(sessionId, { refetchBalance: false }) };
     },
 

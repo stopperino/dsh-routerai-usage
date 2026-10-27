@@ -7,8 +7,6 @@ window.__ModuleLoader__.load({
     const NS = 'routerai-usage';
     const BRIDGE_PREFIX = '/api/dsh-routerai-usage';
     const POLL_MS = 1500;
-    /** Match the host `ContextMeter`: hover opens after 200 ms, leaving closes. */
-    const HOVER_DELAY_MS = 200;
 
     // Visible copy. The package's locale/*.json feed the Plugin Manager display metadata only; the
     // runtime dictionaries are registered into ctx.locale at apply time and mirrored here as the
@@ -60,6 +58,8 @@ window.__ModuleLoader__.load({
       '.dsr-root{flex:none;display:inline-flex;position:relative}',
       '.dsr-trigger{border-radius:var(--dsw-radius-sm,6px);color:var(--dsw-alias-label-tertiary,currentColor);',
       'font-family:inherit;font-size:var(--dsh-content-font-size-secondary,13px);font-variant-numeric:tabular-nums;',
+      // Click-only affordance: the trigger looks (and is) interactive, but the panel toggles on
+      // click rather than following the pointer.
       'line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap;cursor:pointer;',
       'background:0 0;border:none;flex:none;align-items:center;gap:6px;padding:1px 8px;display:inline-flex}',
       '.dsr-trigger:hover,.dsr-trigger[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));',
@@ -437,25 +437,36 @@ window.__ModuleLoader__.load({
       const rootRef = React.useRef(null);
       const triggerRef = React.useRef(null);
       const panelRef = React.useRef(null);
-      const aliveRef = React.useRef(true);
-      const hoverTimer = React.useRef(null);
-
-      React.useEffect(function () {
-        aliveRef.current = true;
-        return function () {
-          aliveRef.current = false;
-        };
-      }, []);
 
       // Poll the aggregated snapshot; the first request is immediate.
+      // A hidden tab stops polling entirely: the mounted-effect check below is a second signal for a
+      // case the Host cannot see (e.g. `document.visibilityState` is already 'hidden'), but the
+      // effect re-runs on every mount, so the timer is re-armed whenever the mount point returns.
       React.useEffect(function () {
         if (sessionId === '') return undefined;
         let cancelled = false;
         let timer = null;
         let controller = null;
+        const hidden = function () {
+          return typeof document !== 'undefined'
+            && typeof document.visibilityState === 'string'
+            && document.visibilityState === 'hidden';
+        };
 
         const load = function () {
           if (cancelled) return;
+          // A background tab never sends anything: no traffic and no upstream cost while unseen.
+          if (hidden()) {
+            if (controller !== null) {
+              try {
+                controller.abort();
+              } catch (error) {
+                /* ignore */
+              }
+              controller = null;
+            }
+            return;
+          }
           if (controller !== null) {
             try {
               controller.abort();
@@ -485,9 +496,20 @@ window.__ModuleLoader__.load({
         load();
         timer = setInterval(load, POLL_MS);
 
+        // Returning to the tab resumes the cadence immediately instead of after the next interval.
+        const onVisibility = function () {
+          if (!hidden()) load();
+        };
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisibility);
+        }
+
         return function () {
           cancelled = true;
           if (timer !== null) clearInterval(timer);
+          if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', onVisibility);
+          }
           if (controller !== null) {
             try {
               controller.abort();
@@ -550,39 +572,13 @@ window.__ModuleLoader__.load({
         };
       }, [open, snapshot]);
 
-      const clearHover = function () {
-        if (hoverTimer.current !== null) {
-          clearTimeout(hoverTimer.current);
-          hoverTimer.current = null;
-        }
-      };
-
-      React.useEffect(function () {
-        return function () {
-          clearHover();
-        };
-      }, []);
-
-      const onEnter = function () {
-        clearHover();
-        hoverTimer.current = setTimeout(function () {
-          if (!aliveRef.current) return;
-          setOpen(true);
-        }, HOVER_DELAY_MS);
-      };
-
-      const onLeave = function () {
-        clearHover();
-        hoverTimer.current = setTimeout(function () {
-          if (!aliveRef.current) return;
-          const panel = panelRef.current;
-          if (panel !== null && panel.matches(':hover')) return;
-          setOpen(false);
-        }, HOVER_DELAY_MS);
-      };
-
-      const toggleOpen = function () {
-        clearHover();
+      // Click-only: the panel opens on an activating click and closes on the next one (or on an
+      // outside pointer-down / Escape, handled below). Hover does nothing at all.
+      //
+      // Still on `onClick`, not `onPointerDown`: a press that starts inside and releases outside
+      // must not toggle, which is exactly what click semantics give us for free.
+      const onTriggerClick = function (event) {
+        if (event && typeof event.preventDefault === 'function') event.preventDefault();
         setOpen(function (value) {
           return !value;
         });
@@ -621,11 +617,9 @@ window.__ModuleLoader__.load({
             ref: triggerRef,
             'aria-expanded': open ? 'true' : 'false',
             'aria-label': label,
-            onMouseEnter: onEnter,
-            onMouseLeave: onLeave,
-            onFocus: onEnter,
-            onBlur: onLeave,
-            onClick: toggleOpen,
+            // Click-only: no onMouseEnter/onMouseLeave (hovering must not open it) and no
+            // onFocus/onBlur (keyboard focus must not pop the panel either).
+            onClick: onTriggerClick,
           },
           segments,
         );
