@@ -580,7 +580,8 @@ window.__ModuleLoader__.load({
 
         // The dock row carries NO branding: balance, then this session's spend behind the session
         // glyph (which replaces the separator dot) - no word, no brand mark.
-        // `title`/`aria-label` carry the Russian hint, since the panel is click-only (no hover cue).
+        // No `title` attribute: it renders a native browser tooltip on hover, which the user asked
+        // to remove. `aria-label` keeps the accessible name for screen readers without any visual.
         const triggerHint = label + '. ' + t('panelHint');
         const segments = [h('span', { className: 'dsr-value', key: 'bal' }, cell.text)];
         if (sessionCost !== null) {
@@ -600,7 +601,6 @@ window.__ModuleLoader__.load({
             ref: triggerRef,
             'aria-expanded': open ? 'true' : 'false',
             'aria-label': triggerHint,
-            title: triggerHint,
             // Click-only: no onMouseEnter/onMouseLeave (hovering must not open it) and no
             // onFocus/onBlur (keyboard focus must not pop the panel either).
             onClick: onTriggerClick,

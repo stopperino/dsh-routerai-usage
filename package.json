@@ -1,6 +1,6 @@
 {
   "name": "dsh-routerai-usage",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "Баланс RouterAI и стоимость запросов для веб-интерфейса DeepSeek Harness: баланс личного кабинета плюс то, что реально израсходовала текущая сессия, включая субагентов.",
   "exports": {
