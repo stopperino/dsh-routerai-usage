@@ -1,8 +1,8 @@
 {
   "name": "dsh-routerai-usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
-  "description": "RouterAI balance and per-request cost for the DeepSeek Harness Web UI: account balance plus what the current session really spent, subagents included.",
+  "description": "Баланс RouterAI и стоимость запросов для веб-интерфейса DeepSeek Harness: баланс личного кабинета плюс то, что реально израсходовала текущая сессия, включая субагентов.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

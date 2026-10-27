@@ -1,18 +1,19 @@
-# dsh-routerai-usage — balance and per-request cost for the RouterAI gateway.
+# dsh-routerai-usage — баланс и стоимость запросов для шлюза RouterAI.
 #
-# The Host half polls GET {baseURL}/credits for the account balance and looks up
-# GET {baseURL}/generation?id=<responseId> for the real cost of every model call,
-# then serves both over a same-origin bridge at /api/dsh-routerai-usage.
-# The Client half renders them under the composer.
+# Хост-часть опрашивает GET {baseURL}/credits для баланса личного кабинета и запрашивает
+# GET {baseURL}/generation?id=<responseId> для реальной стоимости каждого вызова модели,
+# а затем отдаёт и то и другое через same-origin мост по адресу /api/dsh-routerai-usage.
+# Клиентская часть рисует их под полем ввода.
 #
-# Knobs:
-#   pollSeconds:     balance refresh interval while the widget is on screen (default 30)
-#   idlePollSeconds: balance refresh interval while nobody is looking (default 300)
-#   baseURL:         RouterAI API root (default https://routerai.ru/api/v1)
+# Параметры:
+#   pollSeconds:     интервал обновления баланса, пока виджет на экране (по умолчанию 30)
+#   idlePollSeconds: интервал обновления баланса, пока никто не смотрит (по умолчанию 300)
+#   baseURL:         корень API RouterAI (по умолчанию https://routerai.ru/api/v1)
 #
-# `idlePollSeconds` exists because `/credits` used to be polled every 30 s for the whole lifetime
-# of the Host — 2 880 requests a day that nobody saw, perfectly periodic. Unattended it now drops to
-# 1 request / 5 minutes. Both knobs are floored at 10 s, and idle is never allowed below pollSeconds.
+# `idlePollSeconds` существует потому, что раньше `/credits` опрашивался каждые 30 с всё время
+# работы хоста — 2 880 запросов в сутки, которых никто не видел, идеально периодичных. Без
+# присмотра теперь остаётся 1 запрос / 5 минут. Оба параметра снизу ограничены 10 с, и idle
+# никогда не опускается ниже pollSeconds.
 - insert:
     - id: routerai-usage
       name: dsh-routerai-usage

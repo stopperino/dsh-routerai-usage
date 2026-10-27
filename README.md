@@ -1,17 +1,17 @@
 # dsh-routerai-usage
 
-Balance and per-request cost for [RouterAI](https://routerai.ru) inside the DeepSeek Harness Web UI.
+Баланс и стоимость запросов [RouterAI](https://routerai.ru) в веб-интерфейсе DeepSeek Harness.
 
-Shows the account balance plus what the current session has actually spent — including every
-subagent the session spawned — under the composer, with a hover panel breaking the spend down by
-provider and by model.
+Показывает баланс личного кабинета и то, что реально израсходовала текущая сессия — включая всех
+субагентов, которых она породила, — под полем ввода, с панелью, где расход разложен по провайдеру
+и по модели.
 
 ```
 505,14 ₽   ◎ 147,04 ₽
 ```
 
-Click the figure to see the breakdown (click only — hovering does not open it; the next click, an
-outside click, or Escape closes it):
+Нажмите на цифру, чтобы раскрыть детализацию. Панель открывается **только по клику** — наведение
+мыши её не раскрывает; закрывается повторным кликом, кликом вне панели или клавишей Escape.
 
 ```
 ◈ routerai                                    505,14 ₽
@@ -23,83 +23,87 @@ outside click, or Escape closes it):
   deepseek-v4.1-flash            848 запросов · 147,04 ₽
 ```
 
-## Why the cost is exact
+## Почему стоимость точная
 
-RouterAI bills through a routed provider, which does **not** follow the public list price. For
-`deepseek/deepseek-v4.1-flash` the real charge was measured at a constant **2.793×** the list-price
-estimate. A plugin that multiplies tokens by list prices is therefore wrong by a factor of ~3, so
-this one asks RouterAI for the settled amount instead:
+RouterAI выставляет счёт через маршрутизируемого провайдера, и цена там **не** совпадает с
+публичным прайс-листом. Для `deepseek/deepseek-v4.1-flash` реальное списание замерено на
+постоянном уровне **2,793×** от оценки по прайс-листу. Плагин, который умножает токены на
+публичные цены, ошибается примерно в 3 раза — поэтому этот спрашивает у RouterAI фактическую
+сумму:
 
 ```
-GET https://routerai.ru/api/v1/generation?id=<generation-id>   →   data.total_cost   (rubles)
+GET https://routerai.ru/api/v1/generation?id=<generation-id>   →   data.total_cost   (рубли)
 ```
 
-The generation id comes from the Harness session log itself
-(`assistant/message` → `message.source.replayState.response.responseId`), so no request has to be
-intercepted or replayed.
+Идентификатор генерации берётся из самого журнала сессии Harness
+(`assistant/message` → `message.source.replayState.response.responseId`), так что перехватывать
+или воспроизводить запросы не нужно.
 
-## Traffic
+## Трафик
 
-Every settled charge is cached by generation id. A generation id names one immutable, already-billed
-request, so its cost never changes and the cache can never go stale. Reopening a session that is
-already cached costs **no upstream request at all** — measured: 848 rows resolved in ~12 ms, versus
-~4 s and hundreds of requests when cold.
+Каждое списание кэшируется по идентификатору генерации. Идентификатор обозначает один неизменный,
+уже оплаченный запрос, поэтому его стоимость никогда не меняется и кэш не может устареть.
+Повторное открытие уже закэшированной сессии стоит **ноль обращений к серверу** — замерено:
+848 строк разрешились за ~12 мс против ~4 с и сотен запросов при холодном кэше.
 
-The cache stores only `generationId → rubles`. No tokens, no models, no prompts, no session
-content. It is written atomically and is ignored if unreadable.
+Кэш хранит только пары `generationId → рубли`. Никаких токенов, моделей, промптов и содержимого
+сессий. Запись атомарная; нечитаемый файл просто игнорируется.
 
-`GET /credits` follows whether anyone is looking. While the widget is mounted the Client polls
-`/rows` every 1.5 s, which doubles as a presence signal, so the balance refreshes every `pollSeconds`.
-Once that goes quiet the Host stretches the interval to `idlePollSeconds` (default 5 minutes), and the
-Client stops polling entirely while the tab is hidden. Unattended traffic therefore drops from
-2 880 requests a day to ~288 instead of hammering the gateway around the clock.
+`GET /credits` следует за тем, смотрит ли кто-то на виджет. Пока виджет смонтирован, клиент
+опрашивает `/rows` каждые 1,5 с, и это же служит сигналом присутствия, так что баланс обновляется
+раз в `pollSeconds`. Как только опрос прекращается, хост растягивает интервал до `idlePollSeconds`
+(по умолчанию 5 минут), а клиент вообще перестаёт опрашивать при скрытой вкладке. Фоновый трафик
+падает с 2 880 запросов в сутки до ~288, вместо того чтобы круглосуточно дёргать шлюз.
 
-## Install
+## Установка
 
 ```bash
-# from this directory
-dsh plugin install /absolute/path/to/dsh-routerai-usage
+# из этого каталога
+dsh plugin install /абсолютный/путь/к/dsh-routerai-usage
 ```
 
-or add it to a profile and enable the bundle `dsh-routerai-usage`.
+Либо добавьте пакет в профиль и включите bundle `dsh-routerai-usage`.
 
-## Configuration
+## Настройка
 
-The row accepts these options in `cordis.patch.yml`:
+Строка принимает следующие параметры в `cordis.patch.yml`:
 
 ```yaml
 - id: routerai-usage
   name: dsh-routerai-usage
   config:
-    pollSeconds: 30                          # balance refresh while the widget is on screen
-    idlePollSeconds: 300                     # balance refresh while nobody is looking
-    baseURL: https://routerai.ru/api/v1      # API root
+    pollSeconds: 30                          # обновление баланса, пока виджет на экране
+    idlePollSeconds: 300                     # обновление баланса, пока никто не смотрит
+    baseURL: https://routerai.ru/api/v1      # корень API
 ```
 
-## Credentials
+Оба интервала снизу ограничены 10 секундами, и `idlePollSeconds` никогда не опускается ниже
+`pollSeconds`.
 
-The RouterAI API key is read through the Harness credential service under the reference name
-`ROUTERAI_API_KEY` — the same reference the `routerai` LLM provider uses. The plugin never writes it
-anywhere, never logs it, and never returns it to the browser. If it is missing, the widget shows
-«нет ключа» and the rest of the Harness is unaffected.
+## Ключ доступа
 
-## What leaves your machine
+Ключ RouterAI читается через службу учётных данных Harness по имени `ROUTERAI_API_KEY` — тому же,
+что использует провайдер модели `routerai`. Плагин нигде его не сохраняет, не пишет в журналы и не
+возвращает в браузер. Если ключа нет, виджет показывает «нет ключа», а остальной Harness работает
+как обычно.
 
-Exactly two kinds of request, both to the RouterAI API you configure:
+## Что уходит с вашей машины
 
-| Request | Purpose |
+Ровно два вида запросов, оба к тому API RouterAI, который вы настроили:
+
+| Запрос | Назначение |
 |---|---|
-| `GET /credits` | account balance |
-| `GET /generation?id=…` | the settled cost of one already-billed request |
+| `GET /credits` | баланс личного кабинета |
+| `GET /generation?id=…` | фактическая стоимость одного уже оплаченного запроса |
 
-Nothing is sent to the plugin author or any third party, and there is no telemetry.
+Ничего не отправляется автору плагина или третьим лицам, телеметрии нет.
 
-## Compatibility
+## Совместимость
 
-Built against DeepSeek Harness `0.2.1-rc.3`. The client half registers into
-`conversation.composer.dock` and uses only `--dsw-alias-*` theme tokens (each with a fallback), so a
-renamed token degrades the look instead of breaking rendering.
+Собрано под DeepSeek Harness `0.2.1-rc.3`. Клиентская часть регистрируется в
+`conversation.composer.dock` и использует только токены темы `--dsw-alias-*` (каждый с запасным
+значением), поэтому переименованный токен ухудшает вид, но не ломает отрисовку.
 
-## License
+## Лицензия
 
-MIT — see [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE).

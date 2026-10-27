@@ -8,9 +8,8 @@ window.__ModuleLoader__.load({
     const BRIDGE_PREFIX = '/api/dsh-routerai-usage';
     const POLL_MS = 1500;
 
-    // Visible copy. The package's locale/*.json feed the Plugin Manager display metadata only; the
-    // runtime dictionaries are registered into ctx.locale at apply time and mirrored here as the
-    // fallback, so a raw key can never reach the screen.
+    // Visible copy. The plugin serves a Russian service and ships Russian UI only: there is no
+    // English dictionary by design, so the widget never falls back to English text.
     const RU_DICT = {
       title: 'RouterAI',
       source: 'routerai.ru',
@@ -28,25 +27,7 @@ window.__ModuleLoader__.load({
       call: 'запрос',
       calls2: 'запроса',
       calls5: 'запросов',
-    };
-
-    const EN_DICT = {
-      title: 'RouterAI',
-      source: 'routerai.ru',
-      balance: 'Balance',
-      total: 'total',
-      session: 'session',
-      subagents: 'incl. subagents',
-      perProvider: 'By provider',
-      perModel: 'By model',
-      noKey: 'no key',
-      error: 'error',
-      pending: '…',
-      unpriced: '—',
-      loading: 'loading',
-      call: 'request',
-      calls2: 'requests',
-      calls5: 'requests',
+      panelHint: 'Нажмите, чтобы раскрыть расходы',
     };
 
     // Host `ContextMeter` visual language, re-implemented under the `dsr-` prefix:
@@ -599,6 +580,8 @@ window.__ModuleLoader__.load({
 
         // The dock row carries NO branding: balance, then this session's spend behind the session
         // glyph (which replaces the separator dot) - no word, no brand mark.
+        // `title`/`aria-label` carry the Russian hint, since the panel is click-only (no hover cue).
+        const triggerHint = label + '. ' + t('panelHint');
         const segments = [h('span', { className: 'dsr-value', key: 'bal' }, cell.text)];
         if (sessionCost !== null) {
           segments.push(
@@ -616,7 +599,8 @@ window.__ModuleLoader__.load({
             className: 'dsr-trigger',
             ref: triggerRef,
             'aria-expanded': open ? 'true' : 'false',
-            'aria-label': label,
+            'aria-label': triggerHint,
+            title: triggerHint,
             // Click-only: no onMouseEnter/onMouseLeave (hovering must not open it) and no
             // onFocus/onBlur (keyboard focus must not pop the panel either).
             onClick: onTriggerClick,
@@ -651,14 +635,21 @@ window.__ModuleLoader__.load({
       return element;
     }
 
-    /** Last-resort copy: the dictionaries are complete, so a raw key is never shown. */
+    /**
+     * Translate a key. The plugin serves a Russian service (routerai.ru, rubles), so its copy is
+     * always Russian regardless of the Harness UI language: there is deliberately no `en` dictionary
+     * and no fallback chain, and a missing key surfaces as the key itself rather than English text.
+     */
     function fallbackTranslate(key) {
       if (Object.prototype.hasOwnProperty.call(RU_DICT, key)) return RU_DICT[key];
-      if (Object.prototype.hasOwnProperty.call(EN_DICT, key)) return EN_DICT[key];
       return String(key);
     }
 
-    /** ctx.locale is optional: register the dictionaries, else keep the inline RU copy. */
+    /**
+     * The Harness `locale` service is still used, but only to *register* the Russian dictionary so
+     * other surfaces (and the Plugin Manager) can resolve this namespace. It is never asked to
+     * select a language: binding would follow the UI locale and could hand back English.
+     */
     function makeTranslator(ctx) {
       let locale = null;
       try {
@@ -676,7 +667,7 @@ window.__ModuleLoader__.load({
           locale = null;
         }
       }
-      if (locale === null || typeof locale.register !== 'function' || typeof locale.bind !== 'function') {
+      if (locale === null || typeof locale.register !== 'function') {
         return fallbackTranslate;
       }
 
@@ -685,22 +676,8 @@ window.__ModuleLoader__.load({
         const disposeRu = locale.register(NS, 'ru', RU_DICT);
         if (typeof disposeRu === 'function') disposers.push(disposeRu);
       } catch (error) {
-        /* a namespace already owned by someone else: bind below still works */
+        /* a namespace already owned by someone else: the inline copy still works */
       }
-      try {
-        const disposeEn = locale.register(NS, 'en', EN_DICT);
-        if (typeof disposeEn === 'function') disposers.push(disposeEn);
-      } catch (error) {
-        /* see above */
-      }
-
-      let bound = null;
-      try {
-        bound = locale.bind(NS);
-      } catch (error) {
-        bound = null;
-      }
-      if (typeof bound !== 'function') return fallbackTranslate;
 
       if (disposers.length > 0 && typeof ctx.effect === 'function') {
         try {
@@ -714,22 +691,13 @@ window.__ModuleLoader__.load({
                 }
               }
             };
-          }, 'routerai-usage: locale dictionaries');
+          }, 'routerai-usage: locale dictionary');
         } catch (error) {
-          /* the dictionaries stay registered for the page lifetime */
+          /* the dictionary stays registered for the page lifetime */
         }
       }
 
-      return function (key) {
-        let value;
-        try {
-          value = bound(key);
-        } catch (error) {
-          value = undefined;
-        }
-        if (typeof value === 'string' && value !== '' && value !== key) return value;
-        return fallbackTranslate(key);
-      };
+      return fallbackTranslate;
     }
 
     function apply(ctx) {
