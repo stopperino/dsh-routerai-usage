@@ -28,6 +28,11 @@ window.__ModuleLoader__.load({
       calls2: 'запроса',
       calls5: 'запросов',
       panelHint: 'Нажмите, чтобы раскрыть расходы',
+      // Peak-hour surcharge: a provider is charging more than its cheapest rate right now.
+      peakNow: 'Пиковые часы',
+      peakMultiplier: 'цена',
+      peakUntil: 'до',
+      peakOngoing: 'повышенный тариф действует',
     };
 
     // Host `ContextMeter` visual language, re-implemented under the `dsr-` prefix:
@@ -60,6 +65,15 @@ window.__ModuleLoader__.load({
       'line-height:20px;position:fixed}',
       '.dsr-figures{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,currentColor);margin-left:auto;font-weight:500}',
       '.dsr-sub{margin-top:2px;color:var(--dsw-alias-label-tertiary,currentColor);font-variant-numeric:tabular-nums}',
+      // Peak-hour warning: same red as the host's error label, but with a fallback so a renamed
+      // token degrades to plain red instead of dropping the whole declaration.
+      '.dsr-peak{margin-top:6px;padding:6px 8px;border-radius:var(--dsw-radius-sm,6px);',
+      'background:var(--dsw-alias-bg-error,#fdecec);color:var(--dsw-alias-label-error,#c62828);',
+      'font-variant-numeric:tabular-nums;line-height:16px}',
+      '.dsr-peakTitle{font-weight:600}',
+      '.dsr-peakValue{font-variant-numeric:tabular-nums}',
+      // The balance figure turns red while a peak surcharge is active.
+      '.dsr-peakAmount{color:var(--dsw-alias-label-error,#c62828)}',
       '.dsr-subStrong{margin-top:2px;color:var(--dsw-alias-label-secondary,currentColor);font-variant-numeric:tabular-nums}',
       '.dsr-section{margin:10px 0 0}',
       '.dsr-sectionTitle{color:var(--dsw-alias-label-tertiary,currentColor);margin-bottom:2px}',
@@ -279,6 +293,46 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * Normalise the Host's `peak` block.
+     *
+     * The Host reports `{ active, multiplier, endsAt, model, servedBy }` for the most expensive
+     * surcharge among the models the session used. Anything malformed degrades to "no peak": a bad
+     * payload must never paint the balance red.
+     */
+    function peakOf(snapshot) {
+      if (snapshot === null || snapshot === undefined || typeof snapshot !== 'object') return null;
+      const peak = snapshot.peak;
+      if (peak === null || peak === undefined || typeof peak !== 'object') return null;
+      if (peak.active !== true) return null;
+      const multiplier = finiteNumber(peak.multiplier);
+      if (multiplier === null || multiplier <= 1) return null;
+      const endsAt = finiteNumber(peak.endsAt);
+      return {
+        multiplier: multiplier,
+        endsAt: endsAt !== null && endsAt > 0 ? endsAt : null,
+        model: typeof peak.model === 'string' ? peak.model : null,
+        servedBy: typeof peak.servedBy === 'string' ? peak.servedBy : null,
+      };
+    }
+
+    /** Local wall-clock time of the end of the peak window, e.g. «15:00». */
+    function clockText(endsAt) {
+      if (endsAt === null) return null;
+      try {
+        return new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' }).format(new Date(endsAt));
+      } catch (error) {
+        return null;
+      }
+    }
+
+    /** «2×» — the site writes the coefficient before the word «цена», not as a prefix sign. */
+    function multiplierText(value) {
+      if (!isFinite(value)) return null;
+      const rounded = Math.round(value * 100) / 100;
+      return String(rounded) + '\u00d7';
+    }
+
     function Panel(props) {
       const t = props.t;
       const parts = statsOf(props.snapshot);
@@ -295,8 +349,29 @@ window.__ModuleLoader__.load({
       const childCost = children === null ? null : rubText(finiteNumber(children.amountRub));
       const childCalls = children === null ? 0 : finiteNumber(children.calls) ?? 0;
       const descendants = scope === null ? 0 : finiteNumber(scope.descendants) ?? 0;
+      const peak = peakOf(snapshot);
 
       const body = [];
+
+      // Peak surcharge goes FIRST: it is the reason the balance is red, so it must be visible
+      // without reading the rest of the panel.
+      if (peak !== null) {
+        const until = clockText(peak.endsAt);
+        const factor = multiplierText(peak.multiplier);
+        body.push(
+          h(
+            'div',
+            { className: 'dsr-peak', key: 'peak' },
+            h('span', { className: 'dsr-peakTitle' }, t('peakNow') + ': '),
+            h(
+              'span',
+              { className: 'dsr-peakValue' },
+              factor === null ? t('peakOngoing') : t('peakMultiplier') + ' ' + factor,
+            ),
+            until === null ? null : h('span', { className: 'dsr-peakValue' }, ' \u00b7 ' + t('peakUntil') + ' ' + until),
+          ),
+        );
+      }
 
       // Branding lives ONLY here, in the tooltip: the site's mark + lowercase wordmark on the left,
       // and the total balance on the SAME line, right-aligned. No second "routerai.ru" line.
@@ -306,7 +381,11 @@ window.__ModuleLoader__.load({
           { className: 'dsr-brand', key: 'brand' },
           h(Logo, { className: 'dsr-brandMark', size: 14 }),
           h('span', { className: 'dsr-brandName' }, 'routerai'),
-          h('span', { className: 'dsr-figures' }, balanceText === null ? t('pending') : balanceText),
+          h(
+            'span',
+            { className: balanceText === null ? 'dsr-figures' : (peak === null ? 'dsr-figures' : 'dsr-figures dsr-peakAmount') },
+            balanceText === null ? t('pending') : balanceText,
+          ),
         ),
       );
 
@@ -574,16 +653,21 @@ window.__ModuleLoader__.load({
         const parts = statsOf(snapshot);
         const sessionCost = parts.total === null ? null : rubText(finiteNumber(parts.total.amountRub));
         const sessionCalls = parts.total === null ? 0 : finiteNumber(parts.total.calls) ?? 0;
+        const peak = peakOf(snapshot);
 
+        const factor = peak === null ? null : multiplierText(peak.multiplier);
         const label = t('balance') + ': ' + cell.text +
-          (sessionCost !== null ? ' · ' + t('session') + ' ' + sessionCost : '');
+          (sessionCost !== null ? ' · ' + t('session') + ' ' + sessionCost : '') +
+          (peak === null ? '' : '. ' + t('peakNow') + ': ' + (factor === null ? t('peakOngoing') : t('peakMultiplier') + ' ' + factor));
 
         // The dock row carries NO branding: balance, then this session's spend behind the session
         // glyph (which replaces the separator dot) - no word, no brand mark.
         // No `title` attribute: it renders a native browser tooltip on hover, which the user asked
         // to remove. `aria-label` keeps the accessible name for screen readers without any visual.
         const triggerHint = label + '. ' + t('panelHint');
-        const segments = [h('span', { className: 'dsr-value', key: 'bal' }, cell.text)];
+        // While a peak surcharge is active the balance figure is red, so the warning is visible
+        // without opening the panel.
+        const segments = [h('span', { className: peak === null ? 'dsr-value' : 'dsr-value dsr-peakAmount', key: 'bal' }, cell.text)];
         if (sessionCost !== null) {
           segments.push(
             h('span', { className: 'dsr-session', key: 'sess' },

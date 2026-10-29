@@ -38,6 +38,12 @@ const DEFAULT_POLL_SECONDS = 30;
  * signal: when it goes quiet, stretch the interval instead of hammering.
  */
 const DEFAULT_IDLE_POLL_SECONDS = 300;
+/**
+ * How long one `/models/{model}/endpoints` schedule (the source of peak-hour tariffs) is reused.
+ * Provider schedules change on the order of days, so half an hour keeps the extra traffic to two
+ * requests an hour per model and still notices a schedule change well within a session.
+ */
+const DEFAULT_PEAK_REFRESH_SECONDS = 1800;
 /** How long one `rows` call keeps the widget considered attended. */
 const PRESENCE_TTL_MS = 60_000;
 /** Credential *reference* name (not a record key): resolved per call, never cached. */
@@ -97,6 +103,9 @@ function resolveConfig(config) {
       clampInteger(raw.pollSeconds, DEFAULT_POLL_SECONDS, 10, 3600),
       clampInteger(raw.idlePollSeconds, DEFAULT_IDLE_POLL_SECONDS, 10, 3600),
     ),
+    // Peak-hour warnings. `peak: false` disables the whole feature and stops the schedule fetches.
+    peak: raw.peak !== false,
+    peakRefreshSeconds: clampInteger(raw.peakRefreshSeconds, DEFAULT_PEAK_REFRESH_SECONDS, 60, 86_400),
   };
 }
 
@@ -460,6 +469,153 @@ async function readJsonBody(req) {
 }
 
 // ---------------------------------------------------------------------------
+// peak-hour pricing (pure: RouterAI endpoint schedule -> multiplier)
+// ---------------------------------------------------------------------------
+
+/**
+ * RouterAI publishes each provider's time-of-day tariff bands in
+ * `GET /api/v1/models/{author}/{model}/endpoints`, inside `variable_pricings`:
+ *
+ *   { "type": "time-of-day", "utc_start": 100, "utc_end": 400,
+ *     "utc_days": ["monday", ...], "prompt": 3.469e-5, "completion": 1.388e-4 }
+ *
+ * `utc_start`/`utc_end` are HHMM integers in UTC (100 = 01:00); the band wraps past midnight when
+ * `utc_end <= utc_start` (1000 -> 0 means 10:00 until midnight). `utc_days` limits the band to those
+ * UTC weekdays and is absent for "every day". A band's `prompt`/`completion` are absolute prices, so
+ * the schedule is read as a price function rather than as a "peak" flag: some providers publish an
+ * expensive base price plus cheaper bands (BytePlus), others a cheap base plus surcharge bands
+ * (DeepSeek). Comparing each band against the week's cheapest price gives one multiplier definition
+ * that is correct for both shapes.
+ *
+ * Everything here is pure so the decoding can be exercised without a network or a live Host.
+ */
+
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+/** Minutes since UTC midnight for an HHMM integer, clamped to a valid day. */
+function hhmmToMinutes(value) {
+  if (!Number.isFinite(value)) return null;
+  const n = Math.trunc(value);
+  if (n < 0) return null;
+  const hours = Math.floor(n / 100);
+  const minutes = n % 100;
+  if (hours > 24 || minutes > 59) return null;
+  return Math.min(hours * 60 + minutes, 24 * 60);
+}
+
+/** The price a band charges for one unit, preferring prompt tokens and falling back to output. */
+function bandPrice(band) {
+  if (!isPlainObject(band)) return null;
+  for (const key of ['prompt', 'completion']) {
+    const value = band[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return { key, value };
+  }
+  return null;
+}
+
+/**
+ * Normalise one endpoint's `variable_pricings` into bands that can be evaluated at any instant.
+ * Bands without a usable price or window are dropped: an unparseable schedule must degrade to
+ * "no peak information", never to a false warning.
+ */
+function readTariffBands(endpoint) {
+  const raw = endpoint && Array.isArray(endpoint.variable_pricings) ? endpoint.variable_pricings : [];
+  const bands = [];
+  for (const entry of raw) {
+    if (!isPlainObject(entry) || entry.type !== 'time-of-day') continue;
+    const priced = bandPrice(entry);
+    if (priced === null) continue;
+    const start = hhmmToMinutes(entry.utc_start);
+    const end = hhmmToMinutes(entry.utc_end);
+    if (start === null || end === null) continue;
+    let days = null;
+    if (Array.isArray(entry.utc_days) && entry.utc_days.length > 0) {
+      days = entry.utc_days
+        .filter((day) => typeof day === 'string')
+        .map((day) => day.toLowerCase())
+        .filter((day) => WEEKDAYS.includes(day));
+      if (days.length === 0) continue;
+    }
+    bands.push({ start, end, days, price: priced.value, priceKey: priced.key });
+  }
+  return bands;
+}
+
+/** True when `minute` falls in [start, end), following the band across midnight when it wraps. */
+function bandCoversMinute(band, minute) {
+  if (band.start === band.end) return false;
+  if (band.end > band.start) return minute >= band.start && minute < band.end;
+  return minute >= band.start || minute < band.end;
+}
+
+/**
+ * Price per token the schedule charges at `at`.
+ * @returns {{price: number, band: object|null}} the band's price, or the cheapest published band
+ *   when no band covers the instant (schedule gaps exist: DeepSeek is priced off-peak between
+ *   04:00 and 06:00 UTC but RouterAI models that as `0-100`, `100-400`, `400-600`, ... so a gap
+ *   should not happen; if it does, the cheapest band is the safest floor).
+ */
+function priceAt(bands, at) {
+  if (bands.length === 0) return null;
+  const dayIndex = at.getUTCDay();
+  const minute = at.getUTCHours() * 60 + at.getUTCMinutes();
+  for (const band of bands) {
+    if (band.days !== null && !band.days.includes(WEEKDAYS[dayIndex])) continue;
+    if (bandCoversMinute(band, minute)) return { price: band.price, band };
+  }
+  let cheapest = bands[0];
+  for (const band of bands) if (band.price < cheapest.price) cheapest = band;
+  return { price: cheapest.price, band: null };
+}
+
+/** Cheapest price any band charges during a week — the baseline a multiplier is measured against. */
+function cheapestBandPrice(bands) {
+  let cheapest = null;
+  for (const band of bands) {
+    // A band restricted to days cannot be cheaper than the weekly floor; ignoring `days` only ever
+    // lowers the floor, which errs toward not reporting a peak. Both are safe, but including the
+    // band is more accurate when every band is day-restricted.
+    if (cheapest === null || band.price < cheapest) cheapest = band.price;
+  }
+  return cheapest;
+}
+
+/**
+ * How much more expensive the next `lookaheadMs` are than the week's cheapest rate, and when that
+ * premium ends.
+ *
+ * The multiplier is `priceNow / cheapestWeekPrice`, so a provider whose base price is already
+ * expensive and whose bands are discounts (BytePlus) reports no surcharge, while DeepSeek's ×2
+ * peak bands report 2. Scanning forward rather than only looking at "now" means the end of the
+ * window is known even when the schedule has a gap.
+ */
+function evaluatePeak(bands, now, lookaheadMs = 36 * 60 * 60 * 1000, stepMs = 5 * 60 * 1000) {
+  const floor = cheapestBandPrice(bands);
+  const current = priceAt(bands, now);
+  if (floor === null || floor <= 0 || current === null) return null;
+  const multiplier = current.price / floor;
+  // A multiplier of 1 means either no band is active or the active band is the cheapest one.
+  if (!(multiplier > 1)) {
+    return { active: false, multiplier: 1, endsAt: null, priceKey: current.band ? current.band.priceKey : null };
+  }
+  let endsAt = null;
+  for (let offset = stepMs; offset <= lookaheadMs; offset += stepMs) {
+    const probe = priceAt(bands, new Date(now.getTime() + offset));
+    if (probe === null) break;
+    if (probe.price / floor <= 1) {
+      endsAt = now.getTime() + offset;
+      break;
+    }
+  }
+  return {
+    active: true,
+    multiplier: Math.round(multiplier * 100) / 100,
+    endsAt,
+    priceKey: current.band ? current.band.priceKey : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // plugin
 // ---------------------------------------------------------------------------
 
@@ -552,6 +708,126 @@ function apply(ctx, config) {
   const onGenerationFailed = (row) => {
     if (row.lookup !== 'failed') return;
     warn(`generation lookup failed for ${row.id}: ${summarize(row)}`);
+  };
+
+  // -- peak-hour schedules ---------------------------------------------------
+  // Provider tariff bands come from `/models/{model}/endpoints`, which needs no credential, so this
+  // works even before the user configures a key. One entry per model, refreshed at most every
+  // `peakRefreshSeconds`; a failed fetch is remembered for the same period so a broken network does
+  // not turn the balance poll into an endpoint scrape.
+  const schedules = new Map(); // model -> { at:number, bands:object[], error:string|null }
+  let scheduleInFlight = null;
+
+  const readSchedule = async (model) => {
+    const cached = schedules.get(model);
+    const ttl = settings.peakRefreshSeconds * 1000;
+    if (cached !== undefined && Date.now() - cached.at < ttl) return cached;
+    const url = `${settings.baseURL}/models/${model}/endpoints`;
+    let entry;
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      const text = await response.text();
+      let body = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = null;
+      }
+      const endpoints = body && body.data && Array.isArray(body.data.endpoints) ? body.data.endpoints : null;
+      if (!response.ok || endpoints === null) {
+        entry = { at: Date.now(), providerOrder: [], byProvider: new Map(), error: `endpoints HTTP ${response.status}` };
+      } else {
+        // Collapse each provider's bands, keyed by endpoint tag. Providers must stay separate: their
+        // prices live on different scales (BytePlus 1.7e-5, Alibaba 3.8e-5 per token), so a union of
+        // every band would "find" a fictitious surcharge by comparing one provider against another.
+        // RouterAI documents `endpoints` as sorted by routing priority, so the first entry that
+        // publishes bands is the provider a request would normally reach - the only defensible
+        // assumption while `/generation` has not yet named the real one.
+        const byProvider = new Map();
+        const providerOrder = [];
+        for (const endpoint of endpoints) {
+          const tag = endpoint && typeof endpoint.tag === 'string' ? endpoint.tag : null;
+          const bands = readTariffBands(endpoint);
+          if (tag === null || bands.length === 0) continue;
+          byProvider.set(tag, bands);
+          providerOrder.push(tag);
+        }
+        entry = { at: Date.now(), byProvider, providerOrder, error: null };
+      }
+    } catch (error) {
+      entry = {
+        at: Date.now(),
+        byProvider: new Map(),
+        providerOrder: [],
+        error: String(error?.name === 'TimeoutError' ? 'endpoints timed out' : (error?.message ?? error)).slice(0, 160),
+      };
+    }
+    schedules.set(model, entry);
+    return entry;
+  };
+
+  /** Peak state for one model, optionally narrowed to the provider that served the request. */
+  const peakOf = (model, servedBy) => {
+    if (!settings.peak || typeof model !== 'string' || !model) return null;
+    const entry = schedules.get(model);
+    if (entry === undefined) return { active: false, multiplier: 1, endsAt: null, pending: true, model };
+    // Use the provider that actually served the request when `/generation` named it; otherwise the
+    // provider RouterAI would route to first. Never merge providers - see readSchedule.
+    let resolved = servedBy;
+    let bands = servedBy !== null ? entry.byProvider.get(servedBy) : undefined;
+    if (bands === undefined) {
+      resolved = entry.providerOrder.length > 0 ? entry.providerOrder[0] : null;
+      bands = resolved === null ? undefined : entry.byProvider.get(resolved);
+    }
+    if (bands === undefined || bands.length === 0) {
+      return { active: false, multiplier: 1, endsAt: null, model, servedBy: resolved, error: entry.error };
+    }
+    const evaluated = evaluatePeak(bands, new Date());
+    if (evaluated === null) return { active: false, multiplier: 1, endsAt: null, model, servedBy: resolved };
+    return { ...evaluated, model, servedBy: resolved };
+  };
+
+  /** Highest active multiplier among the (model, servedBy) pairs a session actually used. */
+  const peakForPairs = (pairs) => {
+    let best = null;
+    const seen = new Set();
+    for (const pair of pairs) {
+      if (!pair || typeof pair.model !== 'string' || !pair.model) continue;
+      const servedBy = typeof pair.servedBy === 'string' && pair.servedBy ? pair.servedBy : null;
+      const key = `${pair.model}#${servedBy ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const state = peakOf(pair.model, servedBy);
+      if (state !== null && state.active === true && (best === null || state.multiplier > best.multiplier)) {
+        best = state;
+      }
+    }
+    return best;
+  };
+
+  /** Collect the distinct (model, servedBy) pairs behind a set of rows. */
+  const pairsOfRows = (rows) => {
+    const pairs = [];
+    for (const row of rows) pairs.push({ model: row.model, servedBy: row.servedBy });
+    return pairs;
+  };
+
+  /** Prefetch schedules for the models a session used, so the next /rows can report peak state. */
+  const prefetchSchedules = (rows) => {
+    if (!settings.peak) return;
+    for (const row of rows) {
+      if (typeof row.model !== 'string' || !row.model) continue;
+      const cached = schedules.get(row.model);
+      if (cached !== undefined && Date.now() - cached.at < settings.peakRefreshSeconds * 1000) continue;
+      if (scheduleInFlight !== null) continue;
+      scheduleInFlight = readSchedule(row.model)
+        .catch(() => {})
+        .finally(() => { scheduleInFlight = null; });
+    }
   };
 
   // -- pure timer shim -------------------------------------------------------
@@ -1199,6 +1475,7 @@ function apply(ctx, config) {
 
     const childIds = new Set(scope.sessions);
     const stats = statsFor(allRows, sessionId, childIds);
+    prefetchSchedules(allRows);
     return {
       sessionId,
       scope: {
@@ -1215,6 +1492,9 @@ function apply(ctx, config) {
         byModel: stats.byModel,
       },
       balance: publicBalance(),
+      // Peak-hour surcharge for the models this session actually used. `null` when the feature is
+      // off or no schedule is known yet; the Client only paints red on `active === true`.
+      peak: peakForPairs(pairsOfRows(allRows)),
       rows: allRows,
     };
   };
@@ -1231,6 +1511,20 @@ function apply(ctx, config) {
           idlePollSeconds: settings.idlePollSeconds,
           attended: isAttended(),
           balance: publicBalance(),
+          // Peak-hour feature state: which model schedules are loaded and what they say right now.
+          // Diagnostics only; the Client reads `peak` from /rows, where the session's models are known.
+          peak: {
+            enabled: settings.peak,
+            refreshSeconds: settings.peakRefreshSeconds,
+            models: [...schedules.entries()].map(([model, entry]) => ({
+              model,
+              providers: [...entry.byProvider.keys()],
+              primary: entry.providerOrder[0] ?? null,
+              bands: entry.providerOrder.reduce((sum, tag) => sum + entry.byProvider.get(tag).length, 0),
+              error: entry.error,
+              now: peakOf(model, null),
+            })),
+          },
           // Diagnostics for the durable charge cache (path + size only; never its contents).
           cache: {
             file: cacheFile,

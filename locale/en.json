@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "RouterAI: balance and request cost",
-    "description": "Shows the RouterAI account balance in rubles under the composer and the cost of each model request in the current session."
+    "description": "Shows the RouterAI account balance in rubles under the composer, the cost of each model request in the current session, and warns when the provider is charging peak-hour rates."
   },
   "title": "RouterAI",
   "balance": "Balance",
@@ -13,5 +13,9 @@
   "unpriced": "—",
   "requests": "Requests",
   "total": "Total",
-  "calls": "requests"
+  "calls": "requests",
+  "peakNow": "Peak hours",
+  "peakMultiplier": "price",
+  "peakUntil": "until",
+  "peakOngoing": "surcharge active"
 }
