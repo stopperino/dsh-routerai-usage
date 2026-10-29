@@ -34,6 +34,19 @@ window.__ModuleLoader__.load({
       peakUntil: 'до',
       peakOngoing: 'повышенный тариф действует',
       peakLocalTime: 'местное',
+      // Everything that is not a chat completion: media generations the agent made through a shell
+      // call, plus the Harness's own auxiliary model calls. These are the charges the widget used to
+      // miss entirely, which is why the balance fell further than the panel claimed.
+      perKind: 'Кроме чата',
+      kindImage: 'Изображения',
+      kindVideo: 'Видео',
+      kindSpeech: 'Речь',
+      kindTranscription: 'Расшифровка',
+      kindMedia: 'Медиа',
+      kindTitle: 'Заголовки сессий',
+      kindCompaction: 'Сжатие истории',
+      kindUnknown: 'Прочее',
+      unpricedHint: 'стоимость не сообщена',
     };
 
     // Host `ContextMeter` visual language, re-implemented under the `dsr-` prefix:
@@ -233,7 +246,25 @@ window.__ModuleLoader__.load({
         scope,
         byProvider: stats !== null ? listOf(stats.byProvider) : [],
         byModel: stats !== null ? listOf(stats.byModel) : [],
+        byKind: stats !== null ? listOf(stats.byKind) : [],
       };
+    }
+
+    /**
+     * Russian label for one non-chat generation kind. An unfamiliar key is shown verbatim rather than
+     * folded into «Прочее», so a kind this build does not know still reads as what it is.
+     */
+    function kindLabel(t, key) {
+      switch (key) {
+        case 'image': return t('kindImage');
+        case 'video': return t('kindVideo');
+        case 'speech': return t('kindSpeech');
+        case 'transcription': return t('kindTranscription');
+        case 'media': return t('kindMedia');
+        case 'title': return t('kindTitle');
+        case 'compaction': return t('kindCompaction');
+        default: return typeof key === 'string' && key !== '' ? key : t('kindUnknown');
+      }
     }
 
     /**
@@ -289,6 +320,44 @@ window.__ModuleLoader__.load({
               { className: 'dsr-rowValue' },
               formatInteger(calls) + ' ' + pluralRequests(props.t, calls) + (cost === null ? ' · ' + props.t('unpriced') : ' · ' + cost),
             ),
+          );
+        }),
+      );
+    }
+
+    /**
+     * One row per non-chat generation kind.
+     *
+     * Differs from `StatRows` in one way that matters: a kind can be *entirely* unpriced (a session
+     * title has no generation id to look a price up by), and showing it as «— · 2 запроса» would read
+     * as zero spend. The count of unpriced calls is spelled out instead, so the user sees that
+     * something was billed but its amount is not knowable - which is the honest answer, and the one
+     * that explains a balance that fell further than the panel can account for.
+     */
+    function KindRows(props) {
+      const rows = props.rows;
+      if (rows.length === 0) return h('div', { className: 'dsr-empty' }, props.t('pending'));
+      return h(
+        'div',
+        null,
+        rows.map(function (group, index) {
+          const key = typeof group.key === 'string' ? group.key : '';
+          const calls = finiteNumber(group.calls) ?? 0;
+          const unpriced = finiteNumber(group.unpriced) ?? 0;
+          const cost = rubText(finiteNumber(group.amountRub));
+          const parts = [];
+          if (calls > 0) {
+            parts.push(formatInteger(calls) + ' ' + pluralRequests(props.t, calls));
+            parts.push(cost === null ? props.t('unpriced') : cost);
+          }
+          if (unpriced > 0) {
+            parts.push(props.t('unpricedHint') + ' \u00b7 ' + formatInteger(unpriced));
+          }
+          return h(
+            'div',
+            { className: 'dsr-row', key: key + ':' + index },
+            h('dt', { className: 'dsr-rowName' }, kindLabel(props.t, key)),
+            h('dd', { className: 'dsr-rowValue' }, parts.join(' \u00b7 ')),
           );
         }),
       );
@@ -426,6 +495,20 @@ window.__ModuleLoader__.load({
           h('dl', { className: 'dsr-rows' }, h(StatRows, { rows: parts.byProvider, t: t })),
         ),
       );
+
+      // Non-chat charges — media generations and the Harness's own auxiliary model calls. Rendered
+      // only when there are some: an ordinary session stays exactly as it looked before, and the
+      // section's presence is itself the signal that spend happened outside the chat loop.
+      if (parts.byKind.length > 0) {
+        body.push(
+          h(
+            'div',
+            { className: 'dsr-section', key: 'kind' },
+            h('div', { className: 'dsr-sectionTitle' }, t('perKind')),
+            h('dl', { className: 'dsr-rows' }, h(KindRows, { rows: parts.byKind, t: t })),
+          ),
+        );
+      }
 
       body.push(
         h(

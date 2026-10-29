@@ -52,6 +52,87 @@ const CREDENTIAL_REF = 'ROUTERAI_API_KEY';
 const CURRENCY = 'RUB';
 /** Anchored so `${sessionId}:${turn}:${step}` row ids can never match a generation id. */
 const GENERATION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// ---------------------------------------------------------------------------
+// media generations (images, video, speech, transcription)
+// ---------------------------------------------------------------------------
+
+/**
+ * RouterAI serves four billable media endpoints, and none of them reports its charge the way a chat
+ * completion does:
+ *
+ *   POST /v1/images               -> no generation id at all; the charge is `usage.cost` in the body
+ *   POST /v1/videos               -> async task; the billable id rides in `generation_id`
+ *   POST /v1/audio/speech         -> generation id in the `X-Generation-Id` response header
+ *   POST /v1/audio/transcriptions -> same header; charge also in `usage.cost`
+ *
+ * `GET /v1/generation?id=` can price anything that has a generation id, but an image generation has
+ * none and RouterAI exposes no ledger endpoint to enumerate past charges (its OpenAPI document lists
+ * 28 paths, none of which is a statement: https://routerai.ru/api/openapi.json). So a media charge
+ * can only be read from the response the agent actually received, which the Harness records as the
+ * `tool/result` of the shell call that made the request. That call/result pair is what this fold
+ * prices - the missing piece that made the widget under-report the balance.
+ */
+const MEDIA_ENDPOINTS = [
+  // Longest first: `/audio/transcriptions` must win over the shorter prefixes.
+  { path: '/audio/transcriptions', kind: 'transcription' },
+  { path: '/audio/speech', kind: 'speech' },
+  { path: '/images', kind: 'image' },
+  { path: '/videos', kind: 'video' },
+];
+/**
+ * Tools whose output can be an HTTP response body. Detection is limited to these by NAME, so a doc
+ * page that merely quotes `POST /v1/images` - a `web_fetch`, a `read` of a saved markdown file - can
+ * never be mistaken for a billed generation.
+ */
+const SHELL_TOOLS = new Set([
+  'bash', 'pwsh', 'shell', 'terminal', 'exec', 'run',
+  'bash_persistent', 'pwsh_persistent', 'bash-persistent', 'pwsh-persistent',
+]);
+/**
+ * A media body is mostly base64: for an image the `usage` block sits after megabytes of payload, so
+ * both ends of a result are scanned. The cap bounds the work on a very large tool result.
+ */
+const MEDIA_SCAN_LIMIT = 2 * 1024 * 1024;
+/** Tool calls kept while waiting for their result. Interrupted calls never resolve. */
+const MAX_PENDING_CALLS = 500;
+/**
+ * `usage` is the object RouterAI puts the ruble charge in for every media endpoint. Matching the
+ * pair - not a bare `"cost"` anywhere - is what keeps an unrelated JSON blob (a price table scraped
+ * from the docs, say) from being billed to the session.
+ */
+const USAGE_COST_RE = /["']?usage["']?\s*[:=]\s*\{[^{}]{0,4000}?["']?cost["']?\s*[:=]\s*(-?\d+(?:\.\d+)?)/;
+/** `X-Generation-Id: rai-...` as printed by `curl -i`, or a JSON header dump. */
+const GENERATION_HEADER_RE = /x-generation-id["']?\s*[:=]\s*["']?([A-Za-z0-9_-]{1,128})/i;
+/** Video tasks carry the billable id beside the task id. */
+const GENERATION_FIELD_RE = /["']generation_id["']\s*:\s*["']([A-Za-z0-9_-]{1,128})["']/;
+/** The async task envelope's own id, which a later poll addresses. */
+const TASK_ID_FIELD_RE = /["']id["']\s*:\s*["']([A-Za-z0-9_-]{1,128})["']/;
+/** The model that served the request, echoed in the request body or the response. */
+const MODEL_FIELD_RE = /["']model["']\s*:\s*["']([^"']{1,200})["']/;
+/**
+ * Response shapes that identify a media generation even when the command that produced them never
+ * names the endpoint - `node gen.js` around a script the agent wrote earlier. Each marker is a field
+ * only that endpoint returns, so the false-positive surface stays small:
+ *    images        `b64_json` (the base64 payload array element)
+ *    video         `unsigned_urls` / `polling_url` (the async task envelope)
+ *    transcription `"seconds"` inside `usage` plus a `text` field
+ */
+const MEDIA_SHAPE_MARKERS = [
+  { re: /["']b64_json["']\s*:/, kind: 'image' },
+  { re: /["'](?:unsigned_urls|polling_url)["']\s*:/, kind: 'video' },
+];
+/**
+ * Auxiliary model calls the Harness bills to RouterAI but never records as a priced assistant
+ * message: session-title generation and compaction summaries. Both log the request and its usage,
+ * but neither logs a generation id, so they can be shown but not priced - the "unpriced" state the
+ * panel already has for a chat request whose id is missing. Without this they were invisible.
+ */
+const AUX_EVENT_KINDS = {
+  'session/title-llm-request': 'title',
+  'compaction/summary': 'compaction',
+};
+
 /**
  * In-memory retention for the derived row table. Charges are recomputed from the Harness session
  * log, so this is disposable cache, not a source of truth. The *durable* cache is separate: see
@@ -130,6 +211,10 @@ function emptyRow(sessionId, turn, step, time) {
     error: null,
     generationId: null,
     lookup: 'idle',
+    // `chat` for an assistant message, `image`/`video`/`speech`/`transcription` for a media
+    // generation the agent made through a shell call, `title`/`compaction` for the auxiliary model
+    // calls the Harness bills on its own. The Client groups by this, so it must be serialized.
+    kind: 'chat',
   };
 }
 
@@ -167,6 +252,132 @@ function readUsage(usage) {
   return { input, output, cached, reasoning, total };
 }
 
+// -- media generation detection (pure) --------------------------------------
+
+/**
+ * Whether one tool call could have issued a RouterAI media request, and which endpoint it aimed at
+ * when the command says so.
+ *
+ * Two independent gates:
+ *   1. the tool is a shell - the only kind whose result is a raw HTTP response body. A `web_fetch` or
+ *      a `read` that merely quotes `POST /v1/images` is never a billed generation;
+ *   2. the command WRITES, or it POLLS a task it created earlier. A write is `-d`/`--data`/`-F`/
+ *      `-X POST`/`-Method Post`/`method: 'POST'`. A poll is a plain GET of `/v1/videos/{id}`.
+ *
+ * Gate 2 is what keeps "the agent read the docs" from becoming "the agent generated an image": a
+ * page that merely quotes a `usage.cost` example carries no write verb and no task poll. A GET is
+ * accepted only for the video task path, because that is the one media endpoint whose charge arrives
+ * out of band; every other media endpoint reports its cost in the same response that generated it.
+ *
+ * The endpoint name is a *hint*, not a requirement: a script run as `node gen.js` reveals nothing, and
+ * the response-shape check in `applyMediaResult` covers that case.
+ */
+const WRITE_VERB_RE = /(?:\s-d\s|\s--data(?:-raw|-binary|-urlencode)?\s|\s-F\s|\s--form\s|-X\s*(?:POST|PUT|PATCH)\b|-Method\s+(?:Post|Put|Patch)\b|["']?method["']?\s*[:=]\s*["']?(?:POST|PUT|PATCH)\b)/i;
+/** `GET /v1/videos/<taskId>` - the one read that settles a charge. */
+const VIDEO_POLL_RE = /\/videos\/[A-Za-z0-9_-]{2,}/;
+
+function mediaIntentOf(name, argumentsText) {
+  const toolName = typeof name === 'string' ? name.toLowerCase() : '';
+  const base = toolName.includes('.') ? toolName.slice(toolName.lastIndexOf('.') + 1) : toolName;
+  if (!SHELL_TOOLS.has(toolName) && !SHELL_TOOLS.has(base)) return null;
+  if (typeof argumentsText !== 'string' || argumentsText === '') return null;
+
+  const sendsHttp = /\b(?:curl|wget|Invoke-RestMethod|Invoke-WebRequest|WebRequest|https?:\/\/|fetch\(|axios|requests\.(?:post|get))/i
+    .test(argumentsText);
+  if (!sendsHttp) return null;
+
+  // The LAST media endpoint mentioned is the one the command aims at (`curl ... /images` after a
+  // comment that mentions `/videos` must classify as an image request).
+  let hint = null;
+  let hintAt = -1;
+  for (const endpoint of MEDIA_ENDPOINTS) {
+    const at = argumentsText.lastIndexOf(endpoint.path);
+    if (at > hintAt) {
+      hintAt = at;
+      hint = endpoint.kind;
+    }
+  }
+
+  if (WRITE_VERB_RE.test(argumentsText)) return { hint, poll: false };
+  // A poll only makes sense against a task this session created; the row for that task already
+  // exists, so the result settles it instead of creating a second one.
+  if (VIDEO_POLL_RE.test(argumentsText)) return { hint: 'video', poll: true };
+  return null;
+}
+
+/**
+ * One text blob of a tool result, for scanning. Content is normally `[{type:'text',text}]`; a result
+ * that carries an image or file block contributes no text and is skipped by the caller.
+ */
+function resultText(message) {
+  if (!isPlainObject(message) || !Array.isArray(message.content)) return '';
+  let text = '';
+  for (const block of message.content) {
+    if (isPlainObject(block) && typeof block.text === 'string') text += `\n${block.text}`;
+  }
+  return text;
+}
+
+/** Both ends of a possibly huge body, so a `usage` block after megabytes of base64 is still found. */
+function mediaScanText(text) {
+  if (text.length <= MEDIA_SCAN_LIMIT) return text;
+  const half = Math.floor(MEDIA_SCAN_LIMIT / 2);
+  return `${text.slice(0, half)}\n${text.slice(text.length - half)}`;
+}
+
+/**
+ * Which media generation one tool result reports, or null when it reports none.
+ *
+ * The decision is made from the RESPONSE first: a field only one endpoint returns wins over the
+ * command's hint, because a hint is a guess about intent while a `b64_json` is a fact about output.
+ * The hint then covers the case where the shape is generic, and `media` is the honest label when a
+ * charge is present but nothing identifies the endpoint.
+ */
+function mediaKindOf(scanned, hint) {
+  for (const marker of MEDIA_SHAPE_MARKERS) {
+    if (marker.re.test(scanned)) return { kind: marker.kind, confident: true };
+  }
+  if (typeof hint === 'string' && hint !== '') return { kind: hint, confident: true };
+  // A charged `usage` block with no recognizable payload: still a media generation, but the endpoint
+  // is unknown. `media` keeps it in the panel's media section without claiming a specific kind.
+  return { kind: 'media', confident: false };
+}
+
+/**
+ * The ruble charge a media response reports, or null.
+ *
+ * Reads `usage.cost` from the response body, which is where images, speech and transcription put it,
+ * and where a video poll puts it once the task completes. A number is only accepted when it is
+ * finite and non-negative: RouterAI has never charged a negative amount, and a `-1` sentinel in some
+ * unrelated field must not become a credit.
+ */
+function readMediaCharge(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  const match = mediaScanText(text).match(USAGE_COST_RE);
+  if (match === null) return null;
+  const cost = Number(match[1]);
+  if (!Number.isFinite(cost) || cost < 0) return null;
+  return cost;
+}
+
+/** A generation id the response names in a header or in `generation_id`, or null. */
+function readMediaGenerationId(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  const scanned = mediaScanText(text);
+  const header = scanned.match(GENERATION_HEADER_RE);
+  if (header !== null) return header[1];
+  const field = scanned.match(GENERATION_FIELD_RE);
+  return field === null ? null : field[1];
+}
+
+/** The model a media request names, so the panel can break the spend down by model. */
+function readMediaModel(requestText, resultTxt) {
+  const fromRequest = typeof requestText === 'string' ? requestText.match(MODEL_FIELD_RE) : null;
+  if (fromRequest !== null) return fromRequest[1];
+  const fromResult = typeof resultTxt === 'string' ? resultTxt.match(MODEL_FIELD_RE) : null;
+  return fromResult === null ? null : fromResult[1];
+}
+
 /**
  * Fold one session event into `state`.
  *
@@ -194,6 +405,74 @@ function applyEvent(state, sessionId, event) {
       step: null,
     };
     return null;
+  }
+
+  // -- media generations ---------------------------------------------------
+  // A `tool/call` that could have issued a RouterAI media request is remembered here and settled
+  // when its `tool/result` arrives. Rows are keyed by the call id, not by `turn:step`, because one
+  // step can issue several tool calls and each is a separate billable generation.
+  if (event.type === 'tool/call') {
+    const callId = typeof data.callId === 'string' && data.callId ? data.callId : null;
+    if (!callId) return null;
+    const intent = mediaIntentOf(data.name, data.arguments);
+    if (intent === null) return null;
+    state.pendingCalls.set(callId, {
+      hint: intent.hint,
+      poll: intent.poll === true,
+      arguments: typeof data.arguments === 'string' ? data.arguments : '',
+      turn: Number.isFinite(Number(data.turn)) ? Number(data.turn) : null,
+      step: Number.isFinite(Number(data.step)) ? Number(data.step) : null,
+      time: Number.isFinite(event.time) ? event.time : Date.now(),
+    });
+    // Bounded: an interrupted call never produces a result, so the map would otherwise grow for the
+    // life of the session. Map preserves insertion order, so the first key is the oldest.
+    if (state.pendingCalls.size > MAX_PENDING_CALLS) {
+      const oldest = state.pendingCalls.keys().next();
+      if (!oldest.done) state.pendingCalls.delete(oldest.value);
+    }
+    return null;
+  }
+
+  if (event.type === 'tool/result') {
+    const message = isPlainObject(data.message) ? data.message : null;
+    const callId = message && typeof message.toolCallId === 'string' ? message.toolCallId : null;
+    if (!callId) return null;
+    const call = state.pendingCalls.get(callId);
+    if (call === undefined) return null;
+    state.pendingCalls.delete(callId);
+    return applyMediaResult(state, sessionId, callId, call, message, event);
+  }
+
+  // -- auxiliary billed model calls ----------------------------------------
+  // Session titles and compaction summaries are real RouterAI charges that are never logged as a
+  // priced assistant message, so without this they would silently inflate the balance gap.
+  const auxKind = AUX_EVENT_KINDS[event.type];
+  if (auxKind !== undefined) {
+    const key = `${sessionId}:aux:${event.type}:${event.seq ?? state.maxSeq}`;
+    let row = state.rows.get(key);
+    if (!row) {
+      row = emptyRow(sessionId, null, null, Number.isFinite(event.time) ? event.time : Date.now());
+      row.id = key;
+      row.kind = auxKind;
+      state.rows.set(key, row);
+    }
+    const route = isPlainObject(data.route) ? data.route : null;
+    const source = isPlainObject(data.source) ? data.source : null;
+    row.provider = (route && typeof route.provider === 'string' && route.provider)
+      || (source && typeof source.provider === 'string' && source.provider)
+      || 'routerai';
+    row.model = (route && typeof route.model === 'string' && route.model)
+      || (source && isPlainObject(source.model) && typeof source.model.model === 'string' ? source.model.model : null)
+      || row.model;
+    // Neither event records a generation id: the title/compaction API does not surface one. The row
+    // is therefore shown as a real but unpriced charge instead of being dropped.
+    if (row.status !== 'resolved' && row.lookup !== 'done') {
+      row.status = 'unpriced';
+      row.costRub = null;
+      row.lookup = 'done';
+      row.error = null;
+    }
+    return row;
   }
 
   if (event.type !== 'assistant/message') return null;
@@ -270,9 +549,154 @@ function applyEvent(state, sessionId, event) {
   return row;
 }
 
-/** Order: ascending turn, then step (CONTRACT.md `rows` is a complete ordered list). */
+/**
+ * Settle one media generation from the tool result the agent received.
+ *
+ * The rule that decides whether a row exists at all: a media row is created only when the response
+ * proves something was generated - a `usage.cost`, a generation id, or a media payload. A rejected
+ * request (RouterAI does not charge those), a non-media shell call, or an unrelated page never makes
+ * a row, so the panel cannot invent spend that never happened.
+ *
+ * Once a row exists, its status says what is known:
+ *   - `resolved` - the response reported the ruble charge
+ *   - `pending`  - a video task is still running; the id lookup prices it when it settles
+ *   - `unpriced` - a generation happened but this response never stated its cost
+ *
+ * Replaying the same events (cold backfill) must be idempotent, so an already-`resolved` row is never
+ * re-derived: a video create response carries no charge, and re-applying it after a later poll had
+ * priced the row would otherwise erase the amount.
+ */
+function applyMediaResult(state, sessionId, callId, call, message, event) {
+  const text = resultText(message);
+  const scanned = mediaScanText(text);
+  const cost = readMediaCharge(text);
+  const generationId = readMediaGenerationId(text);
+  const failed = message.isError === true;
+  const media = mediaKindOf(scanned, call.hint);
+  const pendingVideo = media.kind === 'video'
+    && /\b(?:in_progress|pending|queued|processing)\b/i.test(scanned);
+
+  // A poll addresses a task this session already created, so its result belongs to that row. Matching
+  // by the task id keeps a completed poll from opening a second row for the same generation.
+  const taskId = typeof text === 'string' ? text.match(TASK_ID_FIELD_RE) : null;
+  const existing = call.poll === true
+    ? findRowByTaskId(state, taskId === null ? null : taskId[1], sessionId)
+    : undefined;
+  if (call.poll === true && existing === undefined) return null;
+
+  // Nothing was generated: no charge, no id, no payload. This is the gate that keeps a failed
+  // request, a docs page quoting the endpoint, or an unrelated API call out of the bill entirely.
+  // A `hint` alone is deliberately NOT enough - the command must have named a media endpoint AND the
+  // response must look like that endpoint's envelope.
+  const billed = typeof cost === 'number' || generationId !== null;
+  if (!billed && !pendingVideo && !(media.confident && hasMediaPayload(scanned))) return null;
+  if (failed && !billed) return null;
+
+  const key = `${sessionId}:media:${callId}`;
+  const time = Number.isFinite(event.time) ? event.time : call.time;
+  let row = existing !== undefined ? existing : state.rows.get(key);
+  if (row === undefined) {
+    row = emptyRow(sessionId, call.turn, call.step, time);
+    row.id = key;
+    row.kind = media.kind;
+    state.rows.set(key, row);
+  }
+  if (row.status === 'resolved') return row; // already priced: a replay must not undo it
+
+  // A poll settles the task's own timestamp, not the poll's: the charge belongs to the moment the
+  // generation was requested, which is what the panel is reading in chronological order.
+  if (existing === undefined) row.time = time;
+  row.provider = 'routerai';
+  row.model = readMediaModel(call.arguments, text) || row.model;
+  if (generationId) row.generationId = generationId;
+  // The task id is kept so a later poll can find this row again in a cold replay, where the create
+  // and the poll arrive in one pass and `pendingCalls` no longer holds the create.
+  if (call.poll !== true && media.kind === 'video' && taskId !== null && row.taskId === undefined) {
+    row.taskId = taskId[1];
+  }
+
+  if (typeof cost === 'number') {
+    row.status = 'resolved';
+    row.costRub = cost;
+    row.error = null;
+    row.lookup = 'done';
+    row.lookupCode = null;
+    row.lookupStatus = undefined;
+    // Priced from its own response, so this row must never be re-fetched by id: an image generation
+    // has no id at all, and a video task id is not a generation id.
+    return row;
+  }
+
+  if (pendingVideo) {
+    // The task exists but is not finished: `POST /v1/videos` only creates it. The ordinary id lookup
+    // prices it later from `generation_id`; the task id itself is not a generation id and would 404.
+    if (row.generationId) {
+      row.status = 'pending';
+      row.costRub = null;
+      row.error = null;
+      row.lookup = 'idle';
+      return row;
+    }
+    // Without a generation id there is nothing to ask later, but the task is still pending, so the
+    // row must stay visible and settleable by a later poll rather than being written off now.
+    row.status = 'pending';
+    row.costRub = null;
+    row.error = null;
+    row.lookup = 'done';
+    return row;
+  }
+
+  // A completed poll that reports no charge cannot be priced after the fact, so it is settled as
+  // unpriced - but only when the row was actually waiting for it.
+  return markUnpriced(row, call.poll === true ? 'video poll reported no cost' : 'media response carried no cost');
+}
+
+/** The row a video task id already owns, so a poll settles it instead of opening a second one. */
+function findRowByTaskId(state, taskId, sessionId) {
+  if (typeof taskId !== 'string' || taskId === '') return undefined;
+  const ownKey = `${sessionId}:media:${taskId}`;
+  const direct = state.rows.get(ownKey);
+  if (direct !== undefined) return direct;
+  for (const row of state.rows.values()) {
+    if (row.taskId === taskId) return row;
+    if (row.kind === 'video' && row.id.endsWith(`:${taskId}`)) return row;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a body actually carries media payload or an explicit cost block, as opposed to merely
+ * mentioning a media endpoint in prose. Used to decide that a charged-looking shell result is a real
+ * generation before a row is created for it.
+ */
+function hasMediaPayload(scanned) {
+  return /["'](?:b64_json|unsigned_urls|polling_url|generation_id|created)["']\s*:/.test(scanned)
+    || /["']?usage["']?\s*[:=]\s*\{/.test(scanned)
+    || /x-generation-id/i.test(scanned);
+}
+
+/** One place that turns a row into the "accounted for, amount unknown" state. */
+function markUnpriced(row, reason) {
+  row.status = 'unpriced';
+  row.costRub = null;
+  row.error = reason || null;
+  row.lookup = 'done';
+  return row;
+}
+
+/**
+ * Row order for every consumer: turn then step, with time as the tie-break.
+ *
+ * Media rows share their tool call's turn/step and auxiliary rows have neither, so a plain numeric
+ * subtraction would sort `null` steps ahead of real ones. Ordering by time in that case keeps the
+ * list chronological, which is what the panel reads.
+ */
 function orderedRows(state) {
-  return [...state.rows.values()].sort((a, b) => (a.turn - b.turn) || (a.step - b.step));
+  const rank = (row) => (Number.isFinite(row.turn) && Number.isFinite(row.step) ? 0 : 1);
+  return [...state.rows.values()].sort((a, b) => (rank(a) - rank(b))
+    || (rank(a) === 0 ? (a.turn - b.turn) || (a.step - b.step) : 0)
+    || ((a.time || 0) - (b.time || 0))
+    || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function roundRub(value) {
@@ -293,6 +717,10 @@ function serializeRow(row) {
     provider: row.provider || 'routerai',
     model: row.model,
     servedBy: row.servedBy,
+    // `chat` for a model completion, `image`/`video`/`speech`/`transcription` for a media generation
+    // the agent requested through a shell call, `title`/`compaction` for the Harness's own auxiliary
+    // model calls. The Client groups by this, so it travels with every row.
+    kind: typeof row.kind === 'string' && row.kind ? row.kind : 'chat',
     status,
     costRub: row.costRub === null || row.costRub === undefined ? null : row.costRub,
     usage: row.usage
@@ -330,10 +758,12 @@ function totalsFor(rows) {
 }
 
 /**
- * Aggregate rows into `{total, own, children, byProvider, byModel}` (CONTRACT-v2.md).
+ * Aggregate rows into `{total, own, children, byProvider, byModel, byKind}` (CONTRACT-v2.md).
  *
  * `own`/`children` are split by the owning session id so the Client can tell the user how much of
- * the spend came from subagents. Pure: takes serialized rows plus the set of child session ids.
+ * the spend came from subagents; `byKind` separates chat completions from media generations and the
+ * Harness's own auxiliary calls, which is what makes "the widget under-counts my balance" legible.
+ * Pure: takes serialized rows plus the set of child session ids.
  */
 function statsFor(rows, rootSessionId, childSessionIds) {
   const isChild = (row) => childSessionIds.has(row.sessionId);
@@ -382,6 +812,10 @@ function statsFor(rows, rootSessionId, childSessionIds) {
     children: childrenRounded,
     byProvider: byKey((row) => row.servedBy || row.provider),
     byModel: byKey((row) => row.model),
+    // Always sorted by amount so the panel can render it without deciding an order, and always
+    // present (empty when there is nothing but chat completions).
+    byKind: byKey((row) => (row.kind === 'chat' || !row.kind ? null : row.kind))
+      .filter((group) => group.key !== '(unknown)'),
   };
 }
 
@@ -692,7 +1126,17 @@ function apply(ctx, config) {
   const stateOf = (sessionId) => {
     let state = sessions.get(sessionId);
     if (!state) {
-      state = { rows: new Map(), current: null, maxSeq: -1, backfilled: false, backfilling: null };
+      state = {
+        rows: new Map(),
+        // `tool/call` records awaiting their `tool/result`, keyed by call id: a media generation is
+        // only known to be billable once its response arrives.
+        pendingCalls: new Map(),
+        current: null,
+        maxSeq: -1,
+        backfilled: false,
+        backfilling: null,
+      };
+
       sessions.set(sessionId, state);
     }
     return state;
@@ -1149,8 +1593,18 @@ function apply(ctx, config) {
     }
   };
 
+  /**
+   * A row is priceable by generation id only when it is a chat completion whose id came from the
+   * assistant message. Media rows are priced from their own response body (an image generation has
+   * no id at all) or, for a video task, from the `generation_id` the task envelope named - never by
+   * the task id, which 404s upstream.
+   */
+  const isIdPriceable = (row) => row.provider === 'routerai'
+    && typeof row.generationId === 'string' && row.generationId !== ''
+    && (row.kind === 'chat' || row.kind === 'video');
+
   const prefetchRow = (row) => {
-    if (!row || !row.generationId || row.provider !== 'routerai') return;
+    if (!isIdPriceable(row)) return;
     if (row.lookup === 'inflight' || row.lookup === 'done') return;
     row.lookup = 'inflight';
     void lookupGeneration(row.generationId).then(
@@ -1171,14 +1625,14 @@ function apply(ctx, config) {
     if (inflight.size >= MAX_UPSTREAM_INFLIGHT) return;
     for (const row of state.rows.values()) {
       if (inflight.size >= MAX_UPSTREAM_INFLIGHT) return;
-      if (row.status === 'pending' && row.lookup === 'idle' && row.generationId) prefetchRow(row);
+      if (row.status === 'pending' && row.lookup === 'idle' && isIdPriceable(row)) prefetchRow(row);
     }
   };
 
   const lookupPending = async (state, budget = MAX_LOOKUPS_PER_CALL) => {
     const jobs = [];
     for (const row of state.rows.values()) {
-      if (row.status === 'pending') jobs.push(row);
+      if (row.status === 'pending' && isIdPriceable(row)) jobs.push(row);
     }
     // Resolve a bounded batch per call: a long session can hold hundreds of pending rows, and the
     // Client polls every 1.5 s, so the remainder is picked up by the following polls (throttled
@@ -1210,7 +1664,10 @@ function apply(ctx, config) {
       const kept = orderedRows(state);
       if (kept.length > MAX_ROWS_PER_SESSION) {
         for (const row of kept.slice(0, kept.length - MAX_ROWS_PER_SESSION)) {
-          state.rows.delete(rowKey(sessionId, row.turn, row.step));
+          // Rows are not all keyed by `turn:step`: media and auxiliary rows carry their own id, so
+          // deleting by a recomputed key would leave them in the map forever (a leak) and would drop
+          // the wrong row when several share a step.
+          state.rows.delete(row.id);
         }
       }
       if (state.rows.size === 0) sessions.delete(sessionId);
@@ -1490,6 +1947,10 @@ function apply(ctx, config) {
         children: stats.children,
         byProvider: stats.byProvider,
         byModel: stats.byModel,
+        // Non-chat spend only, sorted by amount: media generations and the Harness's own auxiliary
+        // model calls. Empty for a session that made nothing but chat completions, which is what lets
+        // the Client hide the section entirely in the ordinary case.
+        byKind: stats.byKind,
       },
       balance: publicBalance(),
       // Peak-hour surcharge for the models this session actually used. `null` when the feature is
