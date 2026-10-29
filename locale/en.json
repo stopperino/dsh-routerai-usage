@@ -17,5 +17,6 @@
   "peakNow": "Peak hours",
   "peakMultiplier": "price",
   "peakUntil": "until",
-  "peakOngoing": "surcharge active"
+  "peakOngoing": "surcharge active",
+  "peakLocalTime": "local time"
 }

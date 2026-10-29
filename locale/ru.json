@@ -17,5 +17,6 @@
   "peakNow": "Пиковые часы",
   "peakMultiplier": "цена",
   "peakUntil": "до",
-  "peakOngoing": "повышенный тариф действует"
+  "peakOngoing": "повышенный тариф действует",
+  "peakLocalTime": "местное"
 }

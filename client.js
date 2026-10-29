@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
       peakMultiplier: 'цена',
       peakUntil: 'до',
       peakOngoing: 'повышенный тариф действует',
+      peakLocalTime: 'местное',
     };
 
     // Host `ContextMeter` visual language, re-implemented under the `dsr-` prefix:
@@ -368,7 +369,11 @@ window.__ModuleLoader__.load({
               { className: 'dsr-peakValue' },
               factor === null ? t('peakOngoing') : t('peakMultiplier') + ' ' + factor,
             ),
-            until === null ? null : h('span', { className: 'dsr-peakValue' }, ' \u00b7 ' + t('peakUntil') + ' ' + until),
+            // The clock is the browser's local time, so say so: the provider publishes its windows
+            // in UTC and a bare "до 15:00" invites reading it against the wrong zone.
+            until === null
+              ? null
+              : h('span', { className: 'dsr-peakValue' }, ' \u00b7 ' + t('peakUntil') + ' ' + until + ' (' + t('peakLocalTime') + ')'),
           ),
         );
       }
