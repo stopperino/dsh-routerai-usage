@@ -1,17 +1,17 @@
 {
   "meta": {
-    "title": "RouterAI: баланс и стоимость запросов",
-    "description": "Показывает баланс личного кабинета RouterAI в рублях под полем ввода и стоимость каждого запроса модели в текущей сессии."
+    "title": "RouterAI: balance and request cost",
+    "description": "Shows the RouterAI account balance in rubles under the composer and the cost of each model request in the current session."
   },
   "title": "RouterAI",
-  "balance": "Баланс",
-  "sessionTotal": "Сессия",
-  "refresh": "Обновить",
-  "noKey": "нет ключа ROUTERAI_API_KEY",
-  "error": "ошибка",
+  "balance": "Balance",
+  "sessionTotal": "Session",
+  "refresh": "Refresh",
+  "noKey": "no ROUTERAI_API_KEY",
+  "error": "error",
   "pending": "…",
   "unpriced": "—",
-  "requests": "Запросы",
-  "total": "Итого",
-  "calls": "запросов"
+  "requests": "Requests",
+  "total": "Total",
+  "calls": "requests"
 }

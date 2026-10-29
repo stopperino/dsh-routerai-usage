@@ -1,13 +1,14 @@
 {
   "name": "dsh-routerai-usage",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "module",
   "description": "Баланс RouterAI и стоимость запросов для веб-интерфейса DeepSeek Harness: баланс личного кабинета плюс то, что реально израсходовала текущая сессия, включая субагентов.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
@@ -40,7 +41,8 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=20",
+    "dsh": ">=0.1.7-rc.1"
   },
   "dsh": {
     "bundle": {
@@ -52,9 +54,6 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
-    },
-    "engines": {
-      "dsh": ">=0.2.1-rc.3"
     }
   }
 }

@@ -68,6 +68,8 @@ const SWEEP_EVERY_MS = 10 * 60 * 1000;
  * CACHE_FLUSH_MS) and capped at CACHE_MAX_ENTRIES; a missing or corrupt file is simply ignored.
  */
 const PRICE_CACHE_FILE = 'dsh-routerai-usage-price-cache.json';
+/** Plugin-private directory under the Harness cache root; keeps scratch files out of `storages`. */
+const PRICE_CACHE_DIR = 'dsh-routerai-usage';
 const CACHE_MAX_ENTRIES = 20000;
 const CACHE_FLUSH_MS = 15_000;
 
@@ -463,16 +465,18 @@ async function readJsonBody(req) {
 
 /** Directory the Harness keeps profile-independent plugin state in. */
 function resolveStateDir() {
-  // DSH_HOME is the documented state root; DSH_PROFILE_DIR is always exported for a
-  // profile-launched Harness and is the reliable fallback.
+  // Documented per-plugin cache root is $DSH_HOME/cache/<plugin>. The price cache used to be
+  // written straight into $DSH_HOME/storages, which is the typed domain-data root shared with other
+  // plugins' units (workspace.json, session caches, ...): a plugin-owned scratch file does not
+  // belong there. DSH_HOME wins first, then the profile-local dir, then the platform user-data area.
   const home = process.env.DSH_HOME;
-  if (typeof home === 'string' && home.trim()) return joinPath(home.trim(), 'storages');
+  if (typeof home === 'string' && home.trim()) return joinPath(home.trim(), 'cache', PRICE_CACHE_DIR);
   const profile = process.env.DSH_PROFILE_DIR;
   if (typeof profile === 'string' && profile.trim()) return joinPath(profile.trim(), '.routerai-usage');
   // Last resort: the platform user-data area, still outside a plugin-owned package.
   try {
     const local = process.env.LOCALAPPDATA || process.env.XDG_STATE_HOME || process.env.HOME;
-    if (typeof local === 'string' && local.trim()) return joinPath(local.trim(), 'dsh-routerai-usage');
+    if (typeof local === 'string' && local.trim()) return joinPath(local.trim(), PRICE_CACHE_DIR);
   } catch {
     /* ignore */
   }
@@ -1339,4 +1343,3 @@ function apply(ctx, config) {
 }
 
 export { apply, inject, name };
-export default { name, inject, apply };

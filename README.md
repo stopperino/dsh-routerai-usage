@@ -57,12 +57,55 @@ GET https://routerai.ru/api/v1/generation?id=<generation-id>   →   data.total_
 
 ## Установка
 
+Плагин ставится в профиль Harness. Подставьте имя своего профиля вместо `web`
+(`dsh plugin --profile <имя> add …`); для десктопного приложения профиль обычно называется
+`desktop`.
+
 ```bash
-# из этого каталога
-dsh plugin install /абсолютный/путь/к/dsh-routerai-usage
+dsh plugin --profile web add https://codeload.github.com/stopperino/dsh-routerai-usage/tar.gz/refs/tags/v1.2.2
 ```
 
-Либо добавьте пакет в профиль и включите bundle `dsh-routerai-usage`.
+Эта ссылка — обычный tarball с GitHub, **Git на машине не нужен**. Именно поэтому она указана
+вместо `github:stopperino/dsh-routerai-usage`: установка git-ссылки запускает `git ls-remote`,
+поэтому на компьютере без Git (или без доступа к git-транспорту GitHub) она падает ещё до
+скачивания пакета. Tarball-ссылка скачивается по HTTPS и работает на чистой машине.
+
+Чтобы поставить последнюю версию из ветки `main`, а не тег:
+
+```bash
+dsh plugin --profile web add https://codeload.github.com/stopperino/dsh-routerai-usage/tar.gz/refs/heads/main
+```
+
+Плагин — это `dsh`-bundle: после установки он появляется в списке плагинов профиля и включается
+там. Две вещи, без которых виджета не будет:
+
+- в профиле должен быть веб-интерфейс Harness — bundle `@deepseek-ai/dsh-web-app`. Без него
+  плагин устанавливается, но его хост-часть навсегда остаётся в состоянии
+  `pending (waiting for service: webServer)`: маршрут `/api/dsh-routerai-usage` регистрировать
+  некуда, а рисовать виджет негде. Профили `web` и десктопное приложение содержат этот bundle;
+- нужен ключ `ROUTERAI_API_KEY` (см. ниже). Без него плагин работает, но показывает «нет ключа».
+
+### Если установка не проходит
+
+- `ERR_PNPM_GIT_RESOLVE_FAILED` / `spawn EPERM` — вы ставите `github:`-ссылку, а Git недоступен.
+  Используйте tarball-ссылку из примера выше.
+- `error: required option '--profile <name>' not specified` — пропущен `--profile`. У команды
+  `dsh plugin` нет подкоманды `install`: аргументы после `--profile <имя>` передаются в `pnpm`,
+  поэтому нужен именно `add <ссылка>`.
+- `installation rejected: … incompatible with dsh …` — версия Harness старше `0.1.7-rc.1`.
+  Обновите Harness либо выдайте исключение:
+  `dsh plugin --profile web allow-version dsh-routerai-usage@1.2.2 --dsh-version <версия> --accept-risk`.
+- `dsh: cannot resolve profile bundle "dsh-routerai-usage"` — пакет не попал в
+  `node_modules` профиля; повторите `add` и проверьте, что профиль тот самый.
+
+### Установка из локального каталога
+
+Для разработки можно поставить каталог напрямую — но учтите, что в манифест профиля попадёт
+**абсолютный** путь `link:…`, поэтому такой профиль не переносится на другую машину:
+
+```bash
+dsh plugin --profile web add /абсолютный/путь/к/dsh-routerai-usage
+```
 
 ## Настройка
 
@@ -100,9 +143,12 @@ dsh plugin install /абсолютный/путь/к/dsh-routerai-usage
 
 ## Совместимость
 
-Собрано под DeepSeek Harness `0.2.1-rc.3`. Клиентская часть регистрируется в
-`conversation.composer.dock` и использует только токены темы `--dsw-alias-*` (каждый с запасным
-значением), поэтому переименованный токен ухудшает вид, но не ломает отрисовку.
+Требуется DeepSeek Harness `0.1.7-rc.1` или новее (`engines.dsh` в `package.json`). Собрано и
+проверено на `0.2.1-rc.3`. Клиентская часть регистрируется в `conversation.composer.dock` и
+использует только токены темы `--dsw-alias-*` (каждый с запасным значением), поэтому
+переименованный токен ухудшает вид, но не ломает отрисовку. Хост-часть требует сервис
+`webServer`, который предоставляет bundle `@deepseek-ai/dsh-web-app`; в профилях без веба
+(например, `headless`/`acp`) плагин остаётся неактивным.
 
 ## Лицензия
 

@@ -1,0 +1,9 @@
+# Scratch directories used for local install/activation testing.
+.tmp-install-test/
+.pnpm-store/
+node_modules/
+
+# Editor / OS noise.
+.DS_Store
+Thumbs.db
+*.log
